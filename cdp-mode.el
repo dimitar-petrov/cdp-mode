@@ -30,6 +30,14 @@
 
 ;; Get ideas from here
 ;; https://github.com/xuchunyang/edit-chrome-textarea.el/blob/master/edit-chrome-textarea.el
+;; (websocket-send-text (aref cdp-mode-current-connection 1) "{\"id\": 1, \"method\": \"Target.getTargets\"}")
+;; (websocket-send-text
+;; (cdp-mode-connection-ws cdp-mode-current-connection) "{\"id\": 1, \"method\": \"Target.getTargets\"}")
+
+;; (cdp-mode--async-request cdp-mode-current-connection "Target.getTargets" '() 'cb)
+;; (defun cb (arg)
+;;  (message-buffer (json-encode arg)))
+
 
 (defcustom cdp-mode-host "127.0.0.1"
   "Host where the Chrome DevTools Protocol is running."
@@ -62,19 +70,52 @@ function, which takes an argument, the JSON result."
 	(json-nul nil))
     (json-read-from-string string)))
 
+;;(defun cdp-connection-callbacks (conn))
+
+(defun log-json (data)
+  (with-current-buffer "*cdp-mode-network-log*"
+    (save-excursion
+      (goto-char (- (point-max) 1))
+      (insert (concat "," (json-encode data) "\n")))))
+
 (defun cdp-mode--ws-on-message (ws frame)
   "Dispatch connection callbacks according to WS and FRAME."
-  (let* ((conn (process-get (websocket-conn ws) 'edit-mode-connection))
-	 (callback (cdp-connection-callbacks conn))
+  (let* ((conn (process-get (websocket-conn ws) 'cdp-mode-connection))
+	 (callbacks (cdp-mode-connection-callbacks conn))
+         ;; => ((id . 1) (method . "Runtime.evaluate") (params (expression . "document.activeElement.value")))
+         ;; <= ((id . 1) (result (result (type . "string") (value . "hello"))))
 	 (json (cdp-mode--json-read-from-string
 		(websocket-frame-text frame)))
 	 (id (alist-get 'id json))
 	 (result (alist-get 'result json)))
-    (pcase (gethash id callbacks)
-      ('nil (message "[cdp-mode] Ignored response, id=%id" id))
-      (func
-       (remhash id callbacks)
-       (funcall func result)))))
+    (if id
+	(pcase (gethash id callbacks)
+	  ('nil (message "[cdp-mode] Ignored response, id=%id" id))
+	  (func
+	   (remhash id callbacks)
+	   (funcall func result)))
+      (log-json json))))
+
+;(defun log-json (data)
+;  (with-current-buffer "*cdp-mode-network-log*"
+;    (let ((res (json-encode data)))
+;      (message "JSON: %s" res)
+;      (insert (concat "BEGIN" res "\n")))))
+
+(defun cdp-mode--async-request (conn method params callback)
+  "Make a JSONRPC request to CONN, expecting a reply, return immediately.
+The request is formed by METHOD, a symbol, and PARAMS a
+JSON object.
+CALLBACK will be called with the response result."
+  (unless params
+    ;; so `json-encode' can encode nil as empty object
+    (setq params #s(hash-table)))
+  (pcase-let (((cl-struct cdp-mode-connection ws id callbacks) conn))
+    (cl-incf (cdp-mode-connection-id conn))
+    (puthash id callback callbacks)
+    (websocket-send-text ws (json-encode (list :id id :method method :params params)))
+    ;; for `cdp-mode--request'
+    id))
 
 (defun cdp-mode-make-connection (ws-url url title)
   "Connect to websocket at WS-URL, store URL and TITLE, return connection."
@@ -86,16 +127,6 @@ function, which takes an argument, the JSON result."
     (setf (cdp-mode-connection-title conn) title)
     conn))
 
-;;(setq ws
-;;      (websocket-open "ws://127.0.1:9222/devtools/browser/1ab39c33-f51d-4acd-af14-74850c2433f5"
-;;		      :on-message (lambda (
-;;					   _websocket
-;;					   frame)
-;;				    (message "ws frame :%S" (websocket-frame-text frame)))
-;;		      :on-close (lambda (_websocket) (message "websocket closed"))))
-;;
-;;(websocket-send-text ws "hello from emacs")
-;;(websocket-close ws)
 
 (defun cdp-mode-new-buffer-name (title url)
   "Return a new buffer name for TITLE and URL."
@@ -113,7 +144,7 @@ It's called with three arguments, URL TITLE, and CONTENT."
 (defun cdp-mode-default-guess-mode-function (_url _title _content)
   "Set major mode for editing buffer depending on URL, TITLE, CONTENT."
   ;; no-op
-  (text-mode))
+  (emacs-lisp-mode))
 
 (defun cdp-mode--url-request (url)
   "Request URL, decode response body as JSON and return it."
@@ -125,6 +156,15 @@ It's called with three arguments, URL TITLE, and CONTENT."
 	     (buffer-substring-no-properties (point) (point-max))
 	     'utf-8))
       (kill-buffer))))
+
+(defun cdp-mode-parse-network ()
+  (interactive)
+  (with-current-buffer (get-buffer-create "*cdp-temp-buffer*")
+    (kill-region (point-min) (point-max))
+    (insert-buffer-substring "*cdp-mode-network-log*")
+    (switch-to-buffer-other-window (current-buffer))
+    (jq-interactively (point-min) (point-max))))
+
 
 (defun cdp-mode ()
   (interactive)
@@ -138,12 +178,18 @@ It's called with three arguments, URL TITLE, and CONTENT."
     (message "Editing %s - %s" title url)
     (setq conn (cdp-mode-make-connection ws-url url title))
     (accept-process-output nil 0.1)
+    (with-current-buffer
+	(generate-new-buffer "*cdp-mode-network-log*")
+      (insert "[{}]"))
+    (cdp-mode--async-request conn "Network.enable" '() '(lambda (arg) ()))
 
     (with-current-buffer (generate-new-buffer
 			  (cdp-mode-new-buffer-name title url))
       (funcall cdp-mode-guess-mode-function url title "content")
-      (setq cdp-current-connection conn)
-      (select-window (display-buffer (current-buffer))))))
+      (setq cdp-mode-current-connection conn)
+      ;; XXX: How will initial buffer selection be organized
+      ;;     (select-window (display-buffer (current-buffer)))
+      )))
 
 (defun cdp-mode--first-page ()
   "Return first page of Chrome, that is, the active tab's page"
